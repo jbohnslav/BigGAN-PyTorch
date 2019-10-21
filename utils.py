@@ -712,10 +712,10 @@ def save_weights(G, D, state_dict, weights_root, experiment_name,
 def load_weights(G, D, state_dict, weights_root, experiment_name, 
                  name_suffix=None, G_ema=None, strict=True, load_optim=True):
   root = '/'.join([weights_root, experiment_name])
-  if name_suffix:
-    print('Loading %s weights from %s...' % (name_suffix, root))
-  else:
-    print('Loading weights from %s...' % root)
+  # if name_suffix:
+  #   print('Loading %s weights from %s...' % (name_suffix, root))
+  # else:
+  #   print('Loading weights from %s...' % root)
   if G is not None:
     G.load_state_dict(
       torch.load('%s/%s.pth' % (root, join_strings('_', ['G', name_suffix]))),
