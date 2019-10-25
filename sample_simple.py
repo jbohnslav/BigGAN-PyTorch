@@ -9,7 +9,8 @@ from queue import LifoQueue, Queue, Empty
 from threading import Thread, Lock
 import random
 from scipy.interpolate import LinearNDInterpolator, griddata, interp1d
-
+import sys
+sys.setrecursionlimit(1500)
 
 queue = Queue(8)
 
@@ -21,19 +22,26 @@ noise_variance = 1
 dim_z = 120
 
 imsize=512
-strategy = 'ewma_position'
+strategy = 'biased_random'
 smooth_style = 'linear'
-
-
+smooth_val = 16
+reset_every = 10
 noise_variance = 1
-truncate_val = 1.75
+truncate_val = 2
+debug = False
+smooth_across_batches = True
+interpolation = cv2.INTER_CUBIC
+name = 'biased_random_walk'
 # dim_z = 2
 
-
+# good combinations
+# biased_random + cubic smoothing + smooth: 16, reset_every 10, smooth across batches
+# ewma_grad + cubic smoothing + smooth: 16, reset every 10, smooth across batches
 
 class Sampler:
     def __init__(self, strategy, z_mean=0, z_var=noise_variance, size=dim_z, ndim=2, 
-      scratch=False, reset_every=5, smooth_style=smooth_style, truncate_val=truncate_val):
+      scratch=False, reset_every=reset_every, smooth_style=smooth_style, truncate_val=truncate_val,
+      smooth_across_batches=smooth_across_batches):
         self.z_mean = z_mean
         self.z_var = z_var
         # self.shape = (batch_size, ndim)
@@ -41,6 +49,7 @@ class Sampler:
         self.scratch = scratch
         self.reset_every = reset_every
         self.batch_num = 0
+        self.smooth_across_batches = smooth_across_batches
         # self.ndim = ndim
 
         assert(strategy in ['random', 'random_walk', 'ewma_grad', 'ewma_position', 
@@ -61,7 +70,7 @@ class Sampler:
         if smooth_style is not None:
             assert(smooth_style in ['linear', 'nearest', 'zero', 'slinear', 'quadratic', 'cubic'])
             self.smooth_style = smooth_style
-            self.should_smooth = True
+            self.should_smooth = False
         else:
             self.should_smooth = False
         self.truncate_val = truncate_val
@@ -71,39 +80,52 @@ class Sampler:
         return(np.random.normal(loc=self.z_mean, 
                                scale=self.z_var, size=(self.size, n)))
     
-    def random_walk(self, n=1, scale=0.1):
+    def random_walk(self, n=1,  step_size=0.1):
         samples = []
-        for i in range(n):
-            if i==0:
-                sample = np.random.normal(loc=self.z_mean, 
-                               scale=self.z_var, size=(self.size, 1))
-            else:
-                sample = samples[i-1] + np.random.normal(loc=self.z_mean, 
-                               scale=self.z_var*scale, size=(self.size, 1))
-            samples.append(sample)
-        samples = np.concatenate(samples,axis=1)
+        if (self.batch_num % self.reset_every) ==0 and hasattr(self, 'prev_sample') :
+            # print('restart')
+            samples = self.reset()
+        else:
+            for i in range(n):
+                if not hasattr(self, 'prev_sample'):
+                    print('scratch')
+                    sample = np.random.normal(loc=self.z_mean, 
+                                   scale=self.z_var, size=(self.size, 1))
+                else:
+                    sample = np.random.normal(loc=self.prev_sample, 
+                                   scale=step_size, size=(self.size, 1))
+                sample = self.truncate(sample)
+                self.prev_sample = sample.copy()
+                samples.append(sample)
+            samples = np.concatenate(samples,axis=1)
+            if self.should_smooth:
+                samples = self.smooth(samples)
+        self.batch_size = n
+        self.batch_num +=1
+            # print(samples.shape)
+        self.prev_batch = samples.copy()
         return(samples)
     
-    def ewma_grad(self, n=1, weight=0.99):
+    def ewma_grad(self, n=1, weight=0.9):
         samples = []
-        if (self.batch_num % self.reset_every) ==0 and hasattr(self, 'prev_batch') :
+        if (self.batch_num % self.reset_every) ==0 and hasattr(self, 'prev_sample') :
           print('restart')
           samples = self.reset()
         else:
           for i in range(n):
-              if i==0 and not hasattr(self, 'prev_batch'):
+              if i==0 and not hasattr(self, 'prev_sample'):
                   print('scratch')
                   sample = np.random.normal(loc=self.z_mean, 
                                  scale=self.z_var, size=(self.size, 1))
               elif i==1 and not hasattr(self, 'prev_grad'):
-                  prev_s = self.prev_batch
+                  prev_s = self.prev_sample
                   new = np.random.normal(loc=self.z_mean, 
                                  scale=self.z_var, size=(self.size, 1))
                   grad = new - prev_s
                   sample = prev_s + grad
                   self.prev_grad = grad.copy()
               elif hasattr(self, 'prev_grad'):
-                  prev_s = self.prev_batch
+                  prev_s = self.prev_sample
                   new = np.random.normal(loc=self.z_mean, 
                                  scale=self.z_var, size=(self.size, 1))
                   grad = new - prev_s
@@ -111,8 +133,18 @@ class Sampler:
                   self.prev_grad = grad.copy()
               else:
                   raise ValueError('not supposed to get here')
-              sample = self.truncate(sample)
-              self.prev_batch = sample.copy()
+              try:
+                  sample = self.truncate(sample)
+              except RecursionError:
+                  prev_s = self.prev_sample
+                  new = np.random.normal(loc=self.z_mean, 
+                                 scale=self.z_var/10, size=(self.size, 1))
+                  grad = new - prev_s
+                  sample = prev_s + (0.5)*grad + (0.5)*self.prev_grad
+                  self.prev_grad = grad.copy()
+                  print('recursion error')
+
+              self.prev_sample = sample.copy()
               samples.append(sample)
           samples = np.concatenate(samples,axis=1)
           if self.should_smooth:
@@ -121,60 +153,60 @@ class Sampler:
         self.batch_size = n
         return(samples)
     
-    def ewma_position(self, n=1, weight=0.9):
+    def ewma_position(self, n=1, weight=0.8):
         samples = []
         # print(self.batch_num % self.reset_every)
-        # restart = self.scratch or not hasattr(self, 'prev_batch') or (self.batch_num % self.reset_every) ==0
-        if (self.batch_num % self.reset_every) ==0 and hasattr(self, 'prev_batch') :
+        # restart = self.scratch or not hasattr(self, 'prev_sample') or (self.batch_num % self.reset_every) ==0
+        if (self.batch_num % self.reset_every) ==0 and hasattr(self, 'prev_sample') :
           # print('restart')
           samples = self.reset()
         else:
           for i in range(n):
-              if i==0 and not hasattr(self, 'prev_batch'):
-                  # print('scratch')
+              if not hasattr(self, 'prev_sample'):
+                  print('scratch')
                   sample = np.random.normal(loc=self.z_mean, 
                                  scale=self.z_var, size=(self.size, 1))
               else:
-                  prev_s = self.prev_batch
-                  new = np.random.normal(loc=prev_s, 
+                  prev_s = self.prev_sample
+                  new = np.random.normal(loc=0, 
                                    scale=self.z_var, size=(self.size, 1))
                   sample =  weight*prev_s + (1-weight)*new
               sample = self.truncate(sample)
               samples.append(sample)
-              self.prev_batch = sample.copy()
+              self.prev_sample = sample.copy()
           samples = np.concatenate(samples,axis=1)
           if self.should_smooth:
             samples = self.smooth(samples)
         self.batch_num +=1 
         self.batch_size = n
-        # print(self.prev_batch.shape)
+        # print(self.prev_sample.shape)
         return(samples)
     
-    def biased_random(self, n=1, step_size=0.2, weight=0.5):
-        if (self.batch_num % self.reset_every) ==0 and hasattr(self, 'prev_batch') :
+    def biased_random(self, n=1, step_size=0.1, weight=0.9):
+        if (self.batch_num % self.reset_every) ==0 and hasattr(self, 'prev_sample') :
             # print('restart')
             samples = self.reset()
         else:
             samples = []
             for i in range(n):
-                if i==0 and not hasattr(self, 'prev_batch'):
+                if i==0 and not hasattr(self, 'prev_sample'):
                     sample = np.random.normal(loc=self.z_mean, 
                                    scale=step_size, size=(self.size, 1))
-                elif i ==1 or (i==0 and hasattr(self, 'prev_batch')):
-                    new = np.random.normal(loc=self.prev_batch, 
+                elif i ==1 or (i==0 and hasattr(self, 'prev_sample')):
+                    new = np.random.normal(loc=self.prev_sample, 
                                    scale=step_size, size=(self.size, 1))
                     # sample =  weight*prev_s + (1-weight)*new
-                    grad = new - self.prev_batch
-                    sample = self.prev_batch + grad
+                    grad = new - self.prev_sample
+                    sample = self.prev_sample + grad
                     prev_grad = grad.copy()
                 elif i >1:
-                    new = np.random.normal(loc=self.prev_batch, 
+                    new = np.random.normal(loc=self.prev_sample, 
                                    scale=step_size, size=(self.size, 1))
-                    grad = new - self.prev_batch
-                    sample = self.prev_batch + weight*grad + (1-weight)*prev_grad
+                    grad = new - self.prev_sample
+                    sample = self.prev_sample + weight*grad + (1-weight)*prev_grad
                     prev_grad = grad.copy()
                 sample = self.truncate(sample)
-                self.prev_batch = sample.copy()
+                self.prev_sample = sample.copy()
                 samples.append(sample)
 
             samples = np.concatenate(samples,axis=1)
@@ -205,7 +237,7 @@ class Sampler:
           vec = self.truncate(vec)
       return(vec)
     
-    def smooth(self, samples, downsample=4):
+    def smooth(self, samples, downsample=smooth_val):
         # print('smoothing')
         ndim, npoints = samples.shape
         points = np.linspace(0,1,npoints)
@@ -219,13 +251,13 @@ class Sampler:
 
         new_samples = np.stack(new_samples)
         # print(new_samples.shape)
-        self.prev_batch = new_samples[:,-1:].copy()
+        self.prev_sample = new_samples[:,-1:].copy()
         return(new_samples)
     
     def reset(self):
-        if not hasattr(self, 'prev_batch'):
+        if not hasattr(self, 'prev_sample'):
             raise ValueError('can''t call reset before a batch')
-        x0 = self.prev_batch
+        x0 = self.prev_sample
         x1 = np.random.normal(loc=self.z_mean, 
                            scale=self.z_var, size=(self.size, 1))
         new_samples = []
@@ -243,12 +275,28 @@ class Sampler:
             new_samples.append(y_hat)
             if i > 0:
               self.prev_grad = new_samples[i] - new_samples[i-1]
-            # print(self.prev_batch.shape)
+            # print(self.prev_sample.shape)
         new_samples = np.stack(new_samples)
-        self.prev_batch = new_samples[:,-1:]
-        # print(self.prev_batch)
-        # print(self.prev_batch.shape)
+        self.prev_sample = new_samples[:,-1:]
+        # print(self.prev_sample)
+        # print(self.prev_sample.shape)
         return(new_samples)
+    def smooth_two_batches(self, b0, b1):
+        # print(b0.shape, b1.shape)
+        big_batch = np.concatenate((b0,b1), axis=1)
+        smoothed = self.smooth(big_batch)
+        b1 = smoothed[:, b0.shape[1]:]
+        return(b1)
+    def smooth_n_batches(self, batches):
+        batch_size = batches[0].shape[1]
+        n = len(batches)
+        big_batch = np.concatenate(batches, axis=1)
+        smoothed = self.smooth(big_batch)
+        out = []
+        for i in range(n):
+          out.append(smoothed[:, i*batch_size:i*batch_size+batch_size])
+        return(out)
+
 
 # class ImageProducer(Thread):
 #   def __init__(self, G, y_, z_, batch_size=32):
@@ -293,7 +341,7 @@ class ImageProducer(Thread):
     self.batch_size=batch_size
     self.sampler = Sampler(strategy)
     self.device = torch.device('cuda:{}'.format(torch.cuda.current_device()))
-
+    # self.total_n =0 
   def stop(self):
     self.should_continue = False
 
@@ -303,26 +351,21 @@ class ImageProducer(Thread):
     while self.should_continue:
       if not queue.full():
         with torch.no_grad():
-          z = []
-          z = self.sampler.sample(n=self.batch_size).astype(np.float32)
+          zs = []
+          for i in range(reset_every):
+            zs.append(self.sampler.sample(n=self.batch_size).astype(np.float32))
+          zs = self.sampler.smooth_n_batches(zs)
           # for i in range(batch_size):
           #   z.append(self.sampler.sample().astype(np.float32))
           # z = np.concatenate(z, axis=1).T
-          z = torch.Tensor(z.T).to(self.device)
-          # print(z)
-          # fuck
-          # print(z.shape)
-          # fuck
-          # z = torch.Tensor(self.sampler.sample().astype(np.float32)).to(self.device)
-          ims = generate_images_from_z(self.G, self.y_, z, batch_size=self.batch_size)
-         
-          # ims = generate_images(self.G, self.y_, self.x0,self.x1, batch_size=self.batch_size)
-        # for im in ims:
-          queue.put(ims)
-          del(z)
-          del(ims)
+          for z in zs:
+            z = torch.Tensor(z.T).to(self.device)
+            ims = generate_images_from_z(self.G, self.y_, z, batch_size=self.batch_size)
+            queue.put(ims)
+            del(z)
+            del(ims)
 
-def generate_images_from_z(G, y_, z, batch_size=32, category=category, imsize=imsize):
+def generate_images_from_z(G, y_, z, batch_size=32, category=category, imsize=imsize, interpolation=interpolation):
     with torch.no_grad():
         # tmp_z = utils.interp(x0, x1, batch_size-2).squeeze()
         y_.fill_(category)
@@ -336,7 +379,7 @@ def generate_images_from_z(G, y_, z, batch_size=32, category=category, imsize=im
       im = ims[i]
       im = ((im+1)/2).clip(min=0, max=1)
       im = cv2.cvtColor(im, cv2.COLOR_RGB2BGR)
-      im = cv2.resize(im, (imsize,imsize), cv2.INTER_CUBIC)
+      im = cv2.resize(im, (imsize,imsize), interpolation=interpolation)
       ims[i] = im
     return(ims)
 
@@ -418,12 +461,14 @@ def run(config):
     
   p = ImageProducer(G, y_, z_, batch_size=G_batch_size)
   p.daemon=True
+  print('starting...')
   p.start()
   time.sleep(1)
 
   cv2.namedWindow('PumGAN', cv2.WINDOW_AUTOSIZE)
   should_continue = True
   fps = 30
+  total_n = 0 
 
   while should_continue:
     if queue.empty():
@@ -437,17 +482,20 @@ def run(config):
 
       if should_save:
         if 'writer' not in locals():
-          fourcc = cv2.VideoWriter_fourcc(*'DIVX')
-          outfile = r'C:\Users\jbohn\Desktop\pumgan.avi'
+          fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+          outfile = r'C:\Users\jbohn\Desktop\\' + name + '.avi'
           writer = cv2.VideoWriter(outfile, fourcc, float(fps), (im.shape[1], im.shape[0]))
         # print(im.min())
         # print(im.max())
         # print(im.shape)
         # should_continue=False
         # break
-        writer.write((im*255).astype(np.uint8).clip(min=0, max=255))
-
+        writer.write((im*255).clip(min=0, max=255).astype(np.uint8))
+      if debug:
+        cv2.putText(im, '{:04d}'.format(total_n), (10, imsize-25), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255),
+          lineType=cv2.LINE_AA)
       cv2.imshow('PumGAN', im)
+      total_n+=1
       k = cv2.waitKey(int(1000/fps))
       if k==27:
         should_continue = False
@@ -456,6 +504,7 @@ def run(config):
   cv2.destroyAllWindows()
   if should_save:
     writer.release()
+  print('Finished')
 
 
 def main():

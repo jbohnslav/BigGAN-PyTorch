@@ -14,23 +14,25 @@ sys.setrecursionlimit(1500)
 
 queue = Queue(8)
 
-should_save = True
+should_save = False
 category = 607
-# category = 972
+# category = 298
 batch_size = 64
 noise_variance = 1
 truncate_val = 2
 
 imsize=720
-strategy = 'random_walk'
+strategy = 'ewma_grad'
 smooth_style = 'cubic'
 smooth_val = 16
 reset_every = 10
+step_size = 0.1 # in measures of standard deviations [0, ~0.2]
 
 debug = False
 smooth_across_batches = True
 interpolation = cv2.INTER_CUBIC
 name = 'random_walk'
+
 
 dim_z = 120
 # dim_z = 2
@@ -81,7 +83,7 @@ class Sampler:
         return(np.random.normal(loc=self.z_mean, 
                                scale=self.z_var, size=(self.size, n)))
     
-    def random_walk(self, n=1,  step_size=0.1):
+    def random_walk(self, n=1,  step_size=step_size):
         samples = []
         if (self.batch_num % self.reset_every) ==0 and hasattr(self, 'prev_sample') :
             # print('restart')
@@ -352,36 +354,42 @@ class ImageProducer(Thread):
     while self.should_continue:
       if not queue.full():
         with torch.no_grad():
-          zs = []
-          for i in range(reset_every):
-            zs.append(self.sampler.sample(n=self.batch_size).astype(np.float32))
-          zs = self.sampler.smooth_n_batches(zs)
-          # for i in range(batch_size):
-          #   z.append(self.sampler.sample().astype(np.float32))
-          # z = np.concatenate(z, axis=1).T
-          for z in zs:
-            z = torch.Tensor(z.T).to(self.device)
-            ims = generate_images_from_z(self.G, self.y_, z, batch_size=self.batch_size)
-            queue.put(ims)
-            del(z)
-            del(ims)
+          try:
+            zs = []
+            for i in range(reset_every):
+              zs.append(self.sampler.sample(n=self.batch_size).astype(np.float32))
+            zs = self.sampler.smooth_n_batches(zs)
+            # for i in range(batch_size):
+            #   z.append(self.sampler.sample().astype(np.float32))
+            # z = np.concatenate(z, axis=1).T
+            for z in zs:
+              z = torch.Tensor(z.T).to(self.device)
+              ims = generate_images_from_z(self.G, self.y_, z, batch_size=self.batch_size)
+              queue.put(ims)
+              del(z)
+              del(ims)
+          except KeyboardInterrupt:
+            raise
 
 def generate_images_from_z(G, y_, z, batch_size=32, category=category, imsize=imsize, interpolation=interpolation):
-    with torch.no_grad():
-        # tmp_z = utils.interp(x0, x1, batch_size-2).squeeze()
-        y_.fill_(category)
-        # y_.sample_()
-        # print(y_)
-        # print(z.shape)
-        o = G(z, G.shared(y_))
-        o = o.detach().cpu().numpy()
-    ims = [o[i].transpose(1,2,0) for i in range(o.shape[0])]
-    for i in range(len(ims)):
-      im = ims[i]
-      im = ((im+1)/2).clip(min=0, max=1)
-      im = cv2.cvtColor(im, cv2.COLOR_RGB2BGR)
-      im = cv2.resize(im, (imsize,imsize), interpolation=interpolation)
-      ims[i] = im
+    try:
+      with torch.no_grad():
+          # tmp_z = utils.interp(x0, x1, batch_size-2).squeeze()
+          y_.fill_(category)
+          # y_.sample_()
+          # print(y_)
+          # print(z.shape)
+          o = G(z, G.shared(y_))
+          o = o.detach().cpu().numpy()
+      ims = [o[i].transpose(1,2,0) for i in range(o.shape[0])]
+      for i in range(len(ims)):
+        im = ims[i]
+        im = ((im+1)/2).clip(min=0, max=1)
+        im = cv2.cvtColor(im, cv2.COLOR_RGB2BGR)
+        im = cv2.resize(im, (imsize,imsize), interpolation=interpolation)
+        ims[i] = im
+    except KeyboardInterrupt:
+      raise
     return(ims)
 
 
@@ -480,9 +488,9 @@ def run(config):
     queue.task_done()
     # print(queue.qsize())
     for im in ims:
-
       if should_save:
         if 'writer' not in locals():
+          print('SAVING TO DISK!')
           fourcc = cv2.VideoWriter_fourcc(*'MJPG')
           outfile = r'C:\Users\jbohn\Desktop\\' + name + '.avi'
           writer = cv2.VideoWriter(outfile, fourcc, float(fps), (im.shape[1], im.shape[0]))
